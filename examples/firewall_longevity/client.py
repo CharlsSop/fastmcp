@@ -43,7 +43,6 @@ import json
 import random
 import sys
 import time
-import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -266,7 +265,6 @@ async def worker(thread_id: int) -> None:
         try:
             transport = StreamableHttpTransport(
                 url=args.server_url,
-                headers={"mcp-session-id": str(uuid.uuid4())},
             )
             msg_handler = _NotifyHandler(stats) if mode == "notify" else None
             async with Client(transport, timeout=args.timeout, message_handler=msg_handler) as client:
