@@ -15,11 +15,27 @@ Exposes all core MCP primitives:
 Modes:
   Normal  : small tool set + all primitives
   Large   : 260 padding tools → tools/list ≈100 KB  (use --large)
+  Fuzzing : ASGI middleware randomly corrupts JSON responses on the wire
+            (use --fuzzing, tune rate with --fuzz-rate 0.0-1.0)
+
+Fuzzing strategies (applied randomly per response):
+  truncate           — cut response body mid-way
+  extra_open_brace   — prepend extra '{' before valid JSON
+  missing_close      — strip last '}' or ']'
+  invalid_field_name — replace a key with !!invalid!! (no quotes)
+  swap_quote         — flip one '"' to "'" (single quote = invalid JSON)
+  insert_garbage     — inject '@#$%^&' at a random position
+  trailing_garbage   — append garbage bytes after the JSON
+  break_colon        — replace one ':' with '='
+  null_byte          — insert a NUL byte (\\x00) at a random position
+  duplicate_comma    — replace one ',' with ',,'
 
 Usage:
     python server.py
     python server.py --large
     python server.py --host 0.0.0.0 --port 9000 --large
+    python server.py --fuzzing --fuzz-rate 0.5
+    python server.py --fuzzing --fuzz-rate 1.0   # fuzz every response
 """
 
 from __future__ import annotations
@@ -28,6 +44,8 @@ import argparse
 import asyncio
 import json
 import os
+import random
+import re
 import sys
 import time
 
@@ -49,6 +67,19 @@ parser.add_argument(
     action="store_true",
     default=False,
     help="Register many padded tools so tools/list response is ~100 KB",
+)
+parser.add_argument(
+    "--fuzzing",
+    action="store_true",
+    default=False,
+    help="Enable JSON fuzzing middleware — randomly corrupts responses on the wire",
+)
+parser.add_argument(
+    "--fuzz-rate",
+    type=float,
+    default=0.3,
+    dest="fuzz_rate",
+    help="Fraction of responses to fuzz (0.0-1.0, default: 0.3 = 30%%)",
 )
 args = parser.parse_args()
 
@@ -352,14 +383,225 @@ else:
 # Entry point
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# JSON Fuzzing — ASGI middleware that corrupts responses on the wire
+# ---------------------------------------------------------------------------
+
+def _fuzz_body(data: bytes) -> tuple[str, bytes]:
+    """Apply one random corruption strategy to raw response bytes.
+
+    Returns (strategy_name, corrupted_bytes).
+    Only corrupts non-empty bodies; passes through empty bodies unchanged.
+    """
+    if not data:
+        return "passthrough", data
+
+    strategy = random.choice([
+        "truncate",
+        "extra_open_brace",
+        "missing_close",
+        "invalid_field_name",
+        "swap_quote",
+        "insert_garbage",
+        "trailing_garbage",
+        "break_colon",
+        "null_byte",
+        "duplicate_comma",
+    ])
+
+    try:
+        s = data.decode("utf-8", errors="replace")
+
+        if strategy == "truncate":
+            cut = random.randint(len(s) // 4, max(len(s) // 4, len(s) - 1))
+            return strategy, s[:cut].encode("utf-8", errors="replace")
+
+        elif strategy == "extra_open_brace":
+            return strategy, (("{" + s) if s.startswith("{") else ("[" + s)).encode("utf-8", errors="replace")
+
+        elif strategy == "missing_close":
+            # Strip the last } or ] from the string
+            stripped = s.rstrip()
+            if stripped and stripped[-1] in ('}', ']'):
+                return strategy, stripped[:-1].encode("utf-8", errors="replace")
+            return strategy, s[:-1].encode("utf-8", errors="replace")
+
+        elif strategy == "invalid_field_name":
+            # Replace a quoted JSON key like "fieldname": with !!invalid!!:
+            patched = re.sub(
+                r'"([a-zA-Z_][a-zA-Z0-9_]*)"(\s*:)',
+                lambda m: f'!!{m.group(1)}!!{m.group(2)}',
+                s, count=1,
+            )
+            return strategy, patched.encode("utf-8", errors="replace")
+
+        elif strategy == "swap_quote":
+            # Flip one " to ' at a random position (single quotes invalid in JSON)
+            positions = [i for i, c in enumerate(s) if c == '"']
+            if positions:
+                idx = random.choice(positions)
+                return strategy, (s[:idx] + "'" + s[idx + 1:]).encode("utf-8", errors="replace")
+            return "passthrough", data
+
+        elif strategy == "insert_garbage":
+            pos = random.randint(1, max(1, len(s) - 1))
+            garbage = "@#$%^&*!"
+            return strategy, (s[:pos] + garbage + s[pos:]).encode("utf-8", errors="replace")
+
+        elif strategy == "trailing_garbage":
+            garbage = " FUZZ_GARBAGE_" + "".join(random.choices("ABCDEF0123456789", k=16))
+            return strategy, (s + garbage).encode("utf-8", errors="replace")
+
+        elif strategy == "break_colon":
+            # Replace first : (used as key separator) with =
+            idx = s.find('":')
+            if idx != -1:
+                pos = idx + 1  # position of ':'
+                return strategy, (s[:pos] + "=" + s[pos + 1:]).encode("utf-8", errors="replace")
+            return "passthrough", data
+
+        elif strategy == "null_byte":
+            pos = random.randint(0, max(0, len(data) - 1))
+            return strategy, data[:pos] + b"\x00" + data[pos:]
+
+        elif strategy == "duplicate_comma":
+            idx = s.find(",")
+            if idx != -1:
+                return strategy, (s[:idx] + ",," + s[idx + 1:]).encode("utf-8", errors="replace")
+            return "passthrough", data
+
+    except Exception:
+        pass
+
+    return "passthrough", data
+
+
+class FuzzingMiddleware:
+    """ASGI middleware that randomly corrupts HTTP response bodies.
+
+    Handles both application/json responses AND text/event-stream (SSE) responses,
+    since MCP Streamable HTTP wraps JSON-RPC payloads inside SSE data: lines.
+    Logs each corruption to stderr so you can correlate with firewall logs.
+    """
+
+    def __init__(self, app, fuzz_rate: float = 0.3) -> None:
+        self.app = app
+        self.fuzz_rate = fuzz_rate
+
+    async def __call__(self, scope, receive, send) -> None:
+        # Only intercept HTTP requests; pass websocket/lifespan through
+        if scope["type"] != "http" or random.random() > self.fuzz_rate:
+            await self.app(scope, receive, send)
+            return
+
+        # Collect the full response so we can inspect Content-Type and fuzz body
+        response_start: dict = {}
+        body_chunks: list[bytes] = []
+
+        async def capture(message: dict) -> None:
+            if message["type"] == "http.response.start":
+                response_start.update(message)
+            elif message["type"] == "http.response.body":
+                body_chunks.append(message.get("body", b""))
+
+        await self.app(scope, receive, capture)
+
+        headers: list[tuple[bytes, bytes]] = response_start.get("headers", [])
+        content_type = next(
+            (v.decode("latin-1") for k, v in headers if k.lower() == b"content-type"),
+            "",
+        )
+        full_body = b"".join(body_chunks)
+        path = scope.get("path", "?")
+
+        if "application/json" in content_type and full_body:
+            # Direct JSON-RPC response
+            strategy, fuzzed_body = _fuzz_body(full_body)
+            print(
+                f"[FUZZ/json] {path}  strategy={strategy}  "
+                f"original={len(full_body)}B  fuzzed={len(fuzzed_body)}B",
+                file=sys.stderr,
+            )
+            new_headers = [
+                (k, str(len(fuzzed_body)).encode() if k.lower() == b"content-length" else v)
+                for k, v in headers
+            ]
+            await send({"type": "http.response.start", "status": response_start.get("status", 200), "headers": new_headers})
+            await send({"type": "http.response.body", "body": fuzzed_body, "more_body": False})
+
+        elif "text/event-stream" in content_type and full_body:
+            # MCP Streamable HTTP: JSON-RPC is embedded in SSE data: lines
+            strategy, fuzzed_body = _fuzz_sse_body(full_body)
+            print(
+                f"[FUZZ/sse]  {path}  strategy={strategy}  "
+                f"original={len(full_body)}B  fuzzed={len(fuzzed_body)}B",
+                file=sys.stderr,
+            )
+            # Drop Content-Length (SSE bodies are variable length)
+            new_headers = [(k, v) for k, v in headers if k.lower() != b"content-length"]
+            await send({"type": "http.response.start", "status": response_start.get("status", 200), "headers": new_headers})
+            await send({"type": "http.response.body", "body": fuzzed_body, "more_body": False})
+
+        else:
+            # Pass through unchanged (binary, empty, unknown type)
+            await send({"type": "http.response.start", "status": response_start.get("status", 200), "headers": headers})
+            await send({"type": "http.response.body", "body": full_body, "more_body": False})
+
+
+def _fuzz_sse_body(data: bytes) -> tuple[str, bytes]:
+    """Fuzz the JSON payload embedded inside SSE event data: lines.
+
+    SSE format:  event: message\\r\\ndata: <JSON>\\r\\n\\r\\n
+    We find data: lines and apply _fuzz_body to the JSON content within them.
+    Each data: line is fuzzed independently with 70% probability so that
+    multi-event SSE streams have a mix of good and bad events.
+    """
+    try:
+        text = data.decode("utf-8", errors="replace")
+        lines = text.splitlines(keepends=True)
+        fuzzed_lines = []
+        used_strategy = "passthrough"
+        for line in lines:
+            if line.startswith("data: "):
+                json_part = line[6:].rstrip("\r\n")
+                if json_part and random.random() < 0.7:
+                    s, fuzzed_json = _fuzz_body(json_part.encode("utf-8"))
+                    if s != "passthrough":
+                        used_strategy = f"sse:{s}"
+                        line = "data: " + fuzzed_json.decode("utf-8", errors="replace") + "\n"
+            fuzzed_lines.append(line)
+        return used_strategy, "".join(fuzzed_lines).encode("utf-8", errors="replace")
+    except Exception:
+        return "passthrough", data
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
 if __name__ == "__main__":
+    import uvicorn
+
+    fuzz_info = (
+        f"  FUZZING ON — rate={args.fuzz_rate:.0%}, {int(args.fuzz_rate * 100)}% of JSON responses will be corrupted"
+        if args.fuzzing
+        else "  Fuzzing: OFF (use --fuzzing to enable)"
+    )
     print(
-        f"[server] Starting Longevity MCP Server on http://{args.host}:{args.port}/mcp",
+        f"[server] Starting Longevity MCP Server on http://{args.host}:{args.port}/mcp\n"
+        f"{fuzz_info}",
         file=sys.stderr,
     )
-    mcp.run(
-        transport="http",
-        host=args.host,
-        port=args.port,
-        log_level="warning",  # keep server output quiet so client output is readable
-    )
+
+    asgi_app = mcp.http_app()
+
+    if args.fuzzing:
+        asgi_app = FuzzingMiddleware(asgi_app, fuzz_rate=args.fuzz_rate)
+        print(
+            f"[server] FuzzingMiddleware active — strategies: truncate, extra_open_brace, "
+            f"missing_close, invalid_field_name, swap_quote, insert_garbage, "
+            f"trailing_garbage, break_colon, null_byte, duplicate_comma",
+            file=sys.stderr,
+        )
+
+    uvicorn.run(asgi_app, host=args.host, port=args.port, log_level="warning")
