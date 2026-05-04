@@ -10,7 +10,7 @@ firewall exercises all wire-format message types.
 
 | File | Purpose |
 |---|---|
-| `server.py` | MCP server exposing tools, resources, prompts, error responses, binary data, progress notifications, and server-push notifications |
+| `server.py` | MCP server exposing tools, resources, prompts, error responses, binary data, progress notifications, server-push notifications, and optional JSON fuzzing middleware |
 | `client.py` | Longevity traffic generator with 9 selectable modes and a live status dashboard |
 
 ---
@@ -53,6 +53,12 @@ python examples/firewall_longevity/server.py --large
 
 # Custom host/port
 python examples/firewall_longevity/server.py --host 0.0.0.0 --port 9000
+
+# Fuzzing mode — randomly corrupts 30% of JSON responses on the wire
+python examples/firewall_longevity/server.py --fuzzing
+
+# Fuzz every single response (100%)
+python examples/firewall_longevity/server.py --fuzzing --fuzz-rate 1.0
 ```
 
 ### 3. Run the client
@@ -113,6 +119,53 @@ python examples/firewall_longevity/client.py \
 | `--host` | `127.0.0.1` | Bind address |
 | `--port` | `8000` | Bind port |
 | `--large` | off | Register ~260 padded tools so `tools/list` ≈ 100 KB |
+| `--fuzzing` | off | Enable JSON fuzzing ASGI middleware |
+| `--fuzz-rate` | `0.3` | Fraction of responses to corrupt (0.0–1.0) |
+
+---
+
+## JSON Fuzzing (Penetration Testing)
+
+The `--fuzzing` flag wraps the server with an ASGI middleware that intercepts
+raw HTTP response bytes and randomly corrupts them **before they leave the
+server**. This tests whether your firewall's MCP JSON parser handles malformed
+input without crashing.
+
+Works on both `application/json` responses and `text/event-stream` (SSE)
+responses — because MCP Streamable HTTP embeds JSON-RPC payloads inside SSE
+`data:` lines.
+
+### Corruption strategies
+
+| Strategy | What it does |
+|---|---|
+| `truncate` | Cuts the body mid-way (simulates partial delivery) |
+| `extra_open_brace` | Prepends an extra `{` (unbalanced brace) |
+| `missing_close` | Strips the last `}` or `]` |
+| `invalid_field_name` | Replaces a JSON key with `!!fieldname!!` (no quotes) |
+| `swap_quote` | Flips one `"` to `'` (single quotes are invalid in JSON) |
+| `insert_garbage` | Injects `@#$%^&*!` at a random offset |
+| `trailing_garbage` | Appends garbage bytes after valid JSON |
+| `break_colon` | Replaces key `:` separator with `=` |
+| `null_byte` | Inserts a `\x00` NUL byte at a random position |
+| `duplicate_comma` | Replaces one `,` with `,,` |
+
+### Server-side log output
+
+Every fuzzed response is logged to stderr:
+```
+[FUZZ/sse]   /mcp  strategy=sse:missing_close  original=3327B  fuzzed=3325B
+[FUZZ/json]  /mcp  strategy=swap_quote         original=512B   fuzzed=512B
+```
+Correlate these timestamps against your firewall logs to see exactly which
+corrupted packets hit the inspection engine and how it responded.
+
+### What to watch for
+
+- Firewall process crash or restart → parser bug
+- Connection silently dropped without RST → parser hung
+- HTTP 200 returned but session broken → parser accepted garbage
+- Clean TCP RST / 400 Bad Request → parser handled it correctly
 
 ---
 
@@ -145,3 +198,8 @@ python examples/firewall_longevity/client.py \
 - **Success %** turns red when below 95 %
 - **Dropped %** turns red when above 5 %
 - `TIMEOUT` / `CONN-ERR` / `HTTP-xxx` in LAST_STATUS indicate firewall drops
+
+> **Tip:** Run the client against a fuzzing server and watch for `ERR` counts
+> rising in the dashboard — those are parse failures triggered by the corrupted
+> responses reaching the client (or the firewall mangling the already-mangled
+> data further). Either way it means your parser is being exercised.
