@@ -40,6 +40,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 import random
 import sys
 import time
@@ -113,6 +114,13 @@ args = parser.parse_args()
 # Resolve legacy --large flag
 if args.large:
     args.mode = "tools"
+
+# ---------------------------------------------------------------------------
+# Silence library log noise (MCP/httpx parse errors from fuzzing go to stderr
+# and corrupt the dashboard — suppress everything below CRITICAL)
+# ---------------------------------------------------------------------------
+
+logging.disable(logging.CRITICAL)
 
 # ---------------------------------------------------------------------------
 # Duration helpers
