@@ -373,7 +373,7 @@ async def dashboard(start_time: float) -> None:
         f"  {'-'*10}  {'-'*24}  {'-'*9}  {'-'*10}"
     )
 
-    LINES_PER_UPDATE = 2 + args.threads + 4
+    LINES_PER_UPDATE = 1 + args.threads + 4
     first_print = True
 
     while not _stop_event.is_set():
