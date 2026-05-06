@@ -43,6 +43,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 import os
 import random
 import re
@@ -82,6 +83,15 @@ parser.add_argument(
     help="Fraction of responses to fuzz (0.0-1.0, default: 0.3 = 30%%)",
 )
 args = parser.parse_args()
+
+# ---------------------------------------------------------------------------
+# Silence FastMCP/MCP library loggers — ToolError tracebacks are intentional
+# (error_tool is a test primitive) and flood the terminal unhelpfully.
+# The server's own print() startup messages are unaffected.
+# ---------------------------------------------------------------------------
+
+logging.getLogger("fastmcp").setLevel(logging.CRITICAL)
+logging.getLogger("mcp").setLevel(logging.CRITICAL)
 
 # ---------------------------------------------------------------------------
 # Server definition
